@@ -1,0 +1,53 @@
+graph TD
+  subgraph Clients
+    Producer["🟢 Producer\n(POST /publish)"]
+    Consumer["🟠 Consumer\n(GET /subscribe)"]
+  end
+
+  subgraph Gateway
+    API["🚪 FastAPI Gateway\n(Routing + LLM Dispatch)"]
+  end
+
+  subgraph Core
+    LB["🔁 gRPC Load Balancer"]
+    Broker1["🧱 Broker Node 1\n(Go, Raft, RocksDB)"]
+    Broker2["🧱 Broker Node 2\n(Go, Raft, RocksDB)"]
+    Broker3["🧱 Broker Node 3\n(Go, Raft, RocksDB)"]
+  end
+
+  subgraph Infra
+    Redis["🧠 Redis\n(Offsets/Metadata)"]
+    RocksDB1["💾 RocksDB"]
+    RocksDB2["💾 RocksDB"]
+    RocksDB3["💾 RocksDB"]
+    LLM["🤖 LLM Worker\n(Python + OpenAI)"]
+    Prometheus["📈 Prometheus"]
+    Grafana["📊 Grafana Dashboard"]
+    OTLP["🔍 OpenTelemetry + Tempo"]
+  end
+
+  Producer --> API
+  Consumer --> API
+  API --> LB
+  LB --> Broker1
+  LB --> Broker2
+  LB --> Broker3
+
+  Broker1 --> RocksDB1
+  Broker2 --> RocksDB2
+  Broker3 --> RocksDB3
+
+  API --> LLM
+  Broker1 --> Redis
+  Broker2 --> Redis
+  Broker3 --> Redis
+
+  Broker1 --> Prometheus
+  Broker2 --> Prometheus
+  Broker3 --> Prometheus
+
+  Prometheus --> Grafana
+  API --> OTLP
+  LB --> OTLP
+  LLM --> OTLP
+  OTLP --> Grafana
