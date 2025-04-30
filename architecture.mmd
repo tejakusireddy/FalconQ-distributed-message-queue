@@ -1,7 +1,5 @@
 graph TD
-  A[Broker]
-
-  A --> B1[Topic: orders]
+  A[Broker] --> B1[Topic: orders]
   A --> B2[Topic: payments]
 
   B1 --> C1[Partition 0]
@@ -9,11 +7,11 @@ graph TD
 
   C1 --> D1[High Priority Queue]
   C1 --> D2[Low Priority Queue]
-  C1 --> E1[Consumer Offsets Map]
+  C1 --> E1[Consumer Offsets (Map)]
 
   C2 --> D3[High Priority Queue]
   C2 --> D4[Low Priority Queue]
-  C2 --> E2[Consumer Offsets Map]
+  C2 --> E2[Consumer Offsets (Map)]
 
   subgraph API Endpoints
     F1[POST /topic/:topic/publish]
