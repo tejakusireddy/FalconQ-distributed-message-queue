@@ -1,53 +1,30 @@
 graph TD
-  subgraph Clients
-    Producer["🟢 Producer\n(POST /publish)"]
-    Consumer["🟠 Consumer\n(GET /subscribe)"]
+  A[Broker]
+
+  A --> B1[Topic: orders]
+  A --> B2[Topic: payments]
+
+  B1 --> C1[Partition 0]
+  B2 --> C2[Partition 0]
+
+  C1 --> D1[High Priority Queue]
+  C1 --> D2[Low Priority Queue]
+  C1 --> E1[Consumer Offsets Map]
+
+  C2 --> D3[High Priority Queue]
+  C2 --> D4[Low Priority Queue]
+  C2 --> E2[Consumer Offsets Map]
+
+  subgraph API Endpoints
+    F1[POST /topic/:topic/publish]
+    F2[GET /topic/:topic/peek]
+    F3[GET /topic/:topic/consume]
+    F4[GET /topics]
+    F5[GET /topics/:topic/partitions]
   end
 
-  subgraph Gateway
-    API["🚪 FastAPI Gateway\n(Routing + LLM Dispatch)"]
-  end
-
-  subgraph Core
-    LB["🔁 gRPC Load Balancer"]
-    Broker1["🧱 Broker Node 1\n(Go, Raft, RocksDB)"]
-    Broker2["🧱 Broker Node 2\n(Go, Raft, RocksDB)"]
-    Broker3["🧱 Broker Node 3\n(Go, Raft, RocksDB)"]
-  end
-
-  subgraph Infra
-    Redis["🧠 Redis\n(Offsets/Metadata)"]
-    RocksDB1["💾 RocksDB"]
-    RocksDB2["💾 RocksDB"]
-    RocksDB3["💾 RocksDB"]
-    LLM["🤖 LLM Worker\n(Python + OpenAI)"]
-    Prometheus["📈 Prometheus"]
-    Grafana["📊 Grafana Dashboard"]
-    OTLP["🔍 OpenTelemetry + Tempo"]
-  end
-
-  Producer --> API
-  Consumer --> API
-  API --> LB
-  LB --> Broker1
-  LB --> Broker2
-  LB --> Broker3
-
-  Broker1 --> RocksDB1
-  Broker2 --> RocksDB2
-  Broker3 --> RocksDB3
-
-  API --> LLM
-  Broker1 --> Redis
-  Broker2 --> Redis
-  Broker3 --> Redis
-
-  Broker1 --> Prometheus
-  Broker2 --> Prometheus
-  Broker3 --> Prometheus
-
-  Prometheus --> Grafana
-  API --> OTLP
-  LB --> OTLP
-  LLM --> OTLP
-  OTLP --> Grafana
+  F1 --> A
+  F2 --> A
+  F3 --> A
+  F4 --> A
+  F5 --> A
