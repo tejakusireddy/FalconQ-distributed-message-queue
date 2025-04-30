@@ -1,5 +1,3 @@
-# distributed-message-queue
-A fault-tolerant distributed message queue system inspired by Kafka, with priority messaging, replication, and real-time monitoring.
 # 🦅 FalconQ – Distributed Message Queue with Priority-Based Messaging
 
 FalconQ is a high-performance distributed message queue inspired by Apache Kafka, built in Go. It supports topic-based pub/sub, queue-based consumption, consumer offset tracking, and **priority-aware message delivery** — all from scratch.
