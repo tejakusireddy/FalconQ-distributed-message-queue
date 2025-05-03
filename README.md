@@ -142,19 +142,18 @@ Coordination: Planned Raft via hashicorp/raft
 Observability: Planned Prometheus + Grafana  
 
 
-🛣️ Roadmap
-✅ Phase 1 – In-memory priority queue concept, REST APIs
-✅ Phase 2 – Add persistent commit log with BadgerDB
-➡️ Phase 3 – Partitioning implementation (Consistent Hashing)
-➡️ Phase 4 – Raft-based leader election and replication
-➡️ Phase 5 – Kubernetes (EKS) deployment + Chaos Mesh
-➡️ Phase 6 – Metrics, Tracing, Dashboard
+🛣️ Roadmap  
+✅ Phase 1 – In-memory priority queue concept, REST APIs  
+✅ Phase 2 – Add persistent commit log with BadgerDB  
+➡️ Phase 3 – Partitioning implementation (Consistent Hashing)  
+➡️ Phase 4 – Raft-based leader election and replication  
+➡️ Phase 5 – Kubernetes (EKS) deployment + Chaos Mesh  
+➡️ Phase 6 – Metrics, Tracing, Dashboard  
 
 
-👨‍💻 Author
-  Sai Teja Kusireddy  
-  Snehith Kongara
-
+👨‍💻 Authors  
+Sai Teja Kusireddy    
+Snehith Kongara  
 
 🏁 License
 MIT — feel free to fork, star, and build on top of it.
