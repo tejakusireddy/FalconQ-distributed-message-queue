@@ -39,7 +39,7 @@ FalconQ is a high-performance distributed message queue inspired by Apache Kafka
 3.  **Install dependencies:**
     go mod tidy
 4.  **Run the broker:**
-    # Make sure you are in the root directory of the project
+    Make sure you are in the root directory of the project
     go run cmd/broker/main.go # Or wherever your main.go is located
     This will start the API server (usually on `localhost:8080`) and create a `falconq_data` directory in the same location for the BadgerDB storage.
 5.  **Use `curl` (or other tools) to interact with the API** (see examples below).
@@ -48,14 +48,13 @@ FalconQ is a high-performance distributed message queue inspired by Apache Kafka
 
 ## 🚦 API Endpoints
 
-| Method | Route                                        | Description                                  |
-| :----- :-------------------------------------------:-----------------------------------------------  |
-| `POST` | `/topic/:topic/publish`                      |Publish a message(JSON: `message`, `priority`)|
-| `GET`  | `/topic/:topic/consume?consumerID=X&batch=N` | Consume N messages (offset tracked)          |
-| `GET`  | `/topic/:topic/peek?offset=X&batch=N`        | Peek messages starting at offset (no consumption)|
-| `GET`  | `/topics`                                    | List all active topic names                      |
-| `GET`  | `/topics/:topic/partitions`                  | View partition IDs for a specific topic          |
-
+| Method | Route                                       | Description                                     |
+|--------|---------------------------------------------|-------------------------------------------------|
+| `POST` | `/topic/:topic/publish`                     | Publish a message (JSON: `message`, `priority`) |
+| `GET`  | `/topic/:topic/consume?consumerID=X&batch=N`| Consume N messages (offset tracked)             |
+| `GET`  | `/topic/:topic/peek?offset=X&batch=N`       | Peek messages starting at offset (no consumption) |
+| `GET`  | `/topics`                                   | List all active topic names                     |
+| `GET`  | `/topics/:topic/partitions`                 | View partition IDs for a specific topic         |
 ---
 
 ## 🧪 Example Usage (cURL)
@@ -76,11 +75,13 @@ curl -X POST http://localhost:8080/topic/orders/publish \
 # Consume messages for consumer 'worker1' (gets high priority first)
 # First call:
 curl "http://localhost:8080/topic/orders/consume?consumerID=worker1&batch=2"
-# Example Response: [{"v":"🔥 Urgent refund request #RF001","p":"high","Offset":0},{"v":"🔥 Critical stock update #SKU001","p":"high","Offset":2}], nextOffset: 3
+# Example Response: 
+[{"v":"🔥 Urgent refund request #RF001","p":"high","Offset":0},{"v":"🔥 Critical stock update #SKU001","p":"high","Offset":2}], nextOffset: 3
 
 # Second call (will get low priority if available):
 curl "http://localhost:8080/topic/orders/consume?consumerID=worker1&batch=2"
-# Example Response: [{"v":"🧊 Normal order placement #ORD001","p":"low","Offset":1}], nextOffset: 2 (Note: actual offset depends on internal filtering)
+# Example Response: 
+[{"v":"🧊 Normal order placement #ORD001","p":"low","Offset":1}], nextOffset: 2 (Note: actual offset depends on internal filtering)
 
 
 # Peek messages starting from offset 0 (gets high priority first)
@@ -95,18 +96,17 @@ curl http://localhost:8080/topics/orders/partitions
 
 
 
-🧠 Architecture
-mermaid
+🧠 Architecture mermaid
 
 Architecture below illustrates how messages flow from REST → Broker → BadgerDB
 
 graph TD
   subgraph User Facing API (Gin)
-    Publish[POST /topic/:topic/publish]
-    Peek[GET /topic/:topic/peek]
-    Consume[GET /topic/:topic/consume]
-    Topics[GET /topics]
-    Partitions[GET /topics/:topic/partitions]
+    Publish[POST /topic/:topic/publish]  
+    Peek[GET /topic/:topic/peek]  
+    Consume[GET /topic/:topic/consume]  
+    Topics[GET /topics]  
+    Partitions[GET /topics/:topic/partitions]  
   end
 
   subgraph Broker Logic (Go)
@@ -125,21 +125,21 @@ graph TD
     Partition0Payments -- Writes/Reads Log --> BadgerDB
   end
 
-  style BadgerDB fill:#f9f,stroke:#333,stroke-width:2px
+   BadgerDB 
 
-  Publish --> Broker
-  Peek --> Broker
-  Consume --> Broker
-  Topics --> Broker
-  Partitions --> Broker
+  Publish --> Broker  
+  Peek --> Broker  
+  Consume --> Broker  
+  Topics --> Broker  
+  Partitions --> Broker  
 
 
-🛠️ Tech Stack
-Language: Go
-Framework: Gin (for REST API)
-Data Store: BadgerDB (Persistent Key-Value Store / Commit Log)
-Coordination: Planned Raft via hashicorp/raft
-Observability: Planned Prometheus + Grafana
+🛠️ Tech Stack  
+Language: Go  
+Framework: Gin (for REST API)  
+Data Store: BadgerDB (Persistent Key-Value Store / Commit Log)  
+Coordination: Planned Raft via hashicorp/raft  
+Observability: Planned Prometheus + Grafana  
 
 
 🛣️ Roadmap
@@ -152,8 +152,8 @@ Observability: Planned Prometheus + Grafana
 
 
 👨‍💻 Author
-Sai Teja Kusireddy,
-Snehith Kongara
+  Sai Teja Kusireddy  
+  Snehith Kongara
 
 
 🏁 License
