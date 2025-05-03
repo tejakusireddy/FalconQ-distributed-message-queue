@@ -1,85 +1,130 @@
+// broker/main.go
+
 package main
 
 import (
-	// "errors" // Removed - was not used
+	"context"        // Added for graceful shutdown
+	"encoding/binary" // Added for encoding uint64 offsets
+	"encoding/json"  // Added for marshalling message values
 	"fmt"
+	"log"
 	"net/http"
-	"sort" // To return sorted topic lists
+	"os"       // Added for graceful shutdown
+	"os/signal" // Added for graceful shutdown
+	"sort"     // To return sorted topic lists
 	"strconv"
 	"sync"
+	"syscall" // Added for graceful shutdown
+	"time"    // Added for graceful shutdown
 
+	"github.com/dgraph-io/badger/v4" // Added BadgerDB
 	"github.com/gin-gonic/gin"
 )
 
-// --- API Error Structure ---
-
-// ApiError defines a standard structure for API error responses.
+// --- API Error Structure --- (Keep as is)
 type ApiError struct {
-	Type    string `json:"type"`              // e.g., "ValidationError", "NotFoundError", "ServerError"
-	Message string `json:"message"`           // User-friendly error message
-	Details string `json:"details,omitempty"` // Optional technical details
+	Type    string `json:"type"`
+	Message string `json:"message"`
+	Details string `json:"details,omitempty"`
 }
 
-// Helper to create a new ApiError
 func NewApiError(errType, message, details string) ApiError {
 	return ApiError{Type: errType, Message: message, Details: details}
 }
 
 // --- Core Data Structures ---
 
-// Message defines the structure for incoming messages
+// Message defines the structure for incoming API messages (Keep as is)
 type Message struct {
 	Value    string `json:"message"`
 	Priority string `json:"priority"` // Expected: "high" or "low"
 }
 
-// Partition holds the data and state for a single partition within a topic.
-type Partition struct {
-	ID              int                // Added ID for clarity in responses
-	HighMessages    []string           // High priority messages log (append-only for now)
-	LowMessages     []string           // Low priority messages log (append-only for now)
-	ConsumerOffsets map[string]int     // Tracks the next offset for each consumerID for this partition
-	mu              sync.RWMutex       // Protects this specific partition's data
-	// TODO: Add retention policy or auto-clean based on offsets/time. Slices grow indefinitely.
+// StoredMessage defines how messages are stored in BadgerDB (Value+Priority)
+type StoredMessage struct {
+	Value    string `json:"v"`
+	Priority string `json:"p"`
+	Offset   uint64 `json:"-"` // Add offset for returning to client, not stored in value
 }
 
-// NewPartition creates a new partition structure.
-func NewPartition(id int) *Partition {
-	return &Partition{
-		ID:              id,
-		HighMessages:    make([]string, 0),
-		LowMessages:     make([]string, 0),
-		ConsumerOffsets: make(map[string]int),
-	}
+// Partition holds the data and state for a single partition within a topic.
+// MODIFIED FOR ISSUE #2
+type Partition struct {
+	ID              int
+	TopicName       string             // Store topic name for key prefixing
+	ConsumerOffsets map[string]uint64  // *** CHANGED value to uint64 *** Tracks next offset per consumer
+	mu              sync.RWMutex       // Protects ConsumerOffsets map
+	db              *badger.DB         // *** ADDED *** Reference to the shared DB instance
+	offsetSeq       *badger.Sequence   // *** ADDED *** Sequence for generating offsets for this partition
+
+	// *** REMOVED HighMessages, LowMessages slices ***
+	// TODO: Add retention policy logic later
 }
 
 // Topic holds multiple partitions and manages access to them.
+// MODIFIED FOR ISSUE #2
 type Topic struct {
 	Name       string
 	Partitions map[int]*Partition // map[partitionID]*Partition
-	mu         sync.RWMutex       // Protects the Partitions map itself (adding/removing partitions)
-}
-
-// NewTopic creates a new topic structure.
-func NewTopic(name string) *Topic {
-	return &Topic{
-		Name:       name,
-		Partitions: make(map[int]*Partition),
-	}
+	mu         sync.RWMutex       // Protects the Partitions map itself
+	db         *badger.DB         // *** ADDED *** Pass DB reference down
 }
 
 // Broker is the top-level structure managing all topics.
+// MODIFIED FOR ISSUE #2
 type Broker struct {
 	Topics map[string]*Topic // map[topicName]*Topic
-	mu     sync.RWMutex    // Protects the Topics map itself (adding/deleting topics)
+	mu     sync.RWMutex    // Protects the Topics map itself
+	db     *badger.DB      // *** ADDED *** Holds the BadgerDB instance
 }
 
-// Global broker instance
-var broker = Broker{Topics: make(map[string]*Topic)}
+// --- Global Broker Instance ---
+// MODIFIED FOR ISSUE #2 - Needs initialization with DB later in main
+var broker *Broker
 
-// --- Helper Functions ---
+// --- Initialization ---
+
+// NewBroker creates a new Broker instance with the BadgerDB handle.
+// *** ADDED FOR ISSUE #2 ***
+func NewBroker(db *badger.DB) *Broker {
+	return &Broker{
+		Topics: make(map[string]*Topic),
+		db:     db,
+	}
+}
+
+// NewTopic creates a new topic structure.
+// *** MODIFIED FOR ISSUE #2 ***
+func NewTopic(name string, db *badger.DB) *Topic {
+	return &Topic{
+		Name:       name,
+		Partitions: make(map[int]*Partition),
+		db:         db, // Store db reference
+	}
+}
+
+// InitializePartition creates and initializes a new partition structure.
+// *** ADDED FOR ISSUE #2 ***
+func InitializePartition(id int, topicName string, db *badger.DB) (*Partition, error) {
+	seqKey := []byte(fmt.Sprintf("t/%s/p/%d/_seq", topicName, id))
+	seq, err := db.GetSequence(seqKey, 100) // Bandwidth=100
+	if err != nil {
+		return nil, fmt.Errorf("failed to get sequence for topic '%s' partition %d: %w", topicName, id, err)
+	}
+
+	return &Partition{
+		ID:              id,
+		TopicName:       topicName,
+		ConsumerOffsets: make(map[string]uint64), // Offset value is now uint64
+		db:              db,
+		offsetSeq:       seq,
+	}, nil
+}
+
+// --- Broker/Topic Methods ---
 
 // getOrCreateTopic retrieves an existing topic or creates a new one safely.
+// *** MODIFIED FOR ISSUE #2 ***
 func (b *Broker) getOrCreateTopic(topicName string) *Topic {
 	b.mu.RLock()
 	topic, exists := b.Topics[topicName]
@@ -95,43 +140,194 @@ func (b *Broker) getOrCreateTopic(topicName string) *Topic {
 		return topic
 	}
 	fmt.Printf("✨ Topic '%s' created.\n", topicName)
-	topic = NewTopic(topicName)
+	topic = NewTopic(topicName, b.db) // Pass db reference
 	b.Topics[topicName] = topic
 	return topic
 }
 
 // getOrCreatePartition retrieves or creates a partition within a topic safely.
-func (t *Topic) getOrCreatePartition(partitionID int) *Partition {
+// *** MODIFIED FOR ISSUE #2 ***
+func (t *Topic) getOrCreatePartition(partitionID int) (*Partition, error) {
 	t.mu.RLock()
 	partition, exists := t.Partitions[partitionID]
 	t.mu.RUnlock()
 	if exists {
-		return partition
+		return partition, nil
 	}
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	partition, exists = t.Partitions[partitionID] // Double-check
 	if exists {
-		return partition
+		return partition, nil
 	}
 	fmt.Printf("🔧 Partition %d created for topic '%s'.\n", partitionID, t.Name)
-	partition = NewPartition(partitionID)
+	var err error
+	partition, err = InitializePartition(partitionID, t.Name, t.db)
+	if err != nil {
+		log.Printf("❌ Failed to initialize partition %d for topic '%s': %v", partitionID, t.Name, err)
+		return nil, err // Propagate error
+	}
 	t.Partitions[partitionID] = partition
-	return partition
+	return partition, nil
 }
 
-// combineMessages combines messages from a partition respecting priority.
-// NOTE: Still potentially inefficient for very large partitions.
-func (p *Partition) combineMessages() []string {
-	// Assumes caller holds at least a Read Lock on p.mu
-	combined := make([]string, 0, len(p.HighMessages)+len(p.LowMessages))
-	combined = append(combined, p.HighMessages...)
-	combined = append(combined, p.LowMessages...)
-	return combined
+// Close releases resources held by the broker (DB connection, sequences).
+// *** ADDED FOR ISSUE #2 ***
+func (b *Broker) Close() error {
+	b.mu.Lock() // Lock broker while closing topics
+	defer b.mu.Unlock()
+	log.Printf("Releasing sequences for %d topics...", len(b.Topics))
+	topicsToClose := make([]*Topic, 0, len(b.Topics))
+	for _, topic := range b.Topics {
+		topicsToClose = append(topicsToClose, topic)
+	}
+	// Release topic locks before closing sequences/partitions to avoid deadlock potential if partition closing needs topic lock
+	// (Although current logic doesn't require it, it's safer practice)
+
+
+	for _, topic := range topicsToClose {
+		topic.mu.Lock() // Lock topic while closing partitions
+		partitionsToClose := make([]*Partition, 0, len(topic.Partitions))
+		for _, partition := range topic.Partitions {
+			partitionsToClose = append(partitionsToClose, partition)
+		}
+		topic.mu.Unlock() // Unlock topic before closing partitions
+
+		for _, partition := range partitionsToClose {
+			if partition.offsetSeq != nil {
+				// Release sequence resources back to BadgerDB
+				// Use background context as server shutdown might be finishing
+				if err := partition.offsetSeq.Release(); err != nil {
+					log.Printf("WARN: Failed to release sequence for topic %s partition %d: %v", topic.Name, partition.ID, err)
+					// Continue trying to close others
+				} else {
+					//fmt.Printf("DEBUG: Released sequence for %s p%d\n", topic.Name, partition.ID) // Debug
+				}
+			}
+		}
+	}
+	log.Println("Closing BadgerDB...")
+	return b.db.Close() // Close the main DB connection
 }
 
-// min returns the smaller of two integers.
+
+// --- Partition Methods ---
+// *** ADDED FOR ISSUE #2 ***
+
+// GenerateKey creates the BadgerDB key for a message offset.
+// Key Format: t/<topicName>/p/<partitionID>/m/<offset_bytes>
+func GenerateKey(topicName string, partitionID int, offset uint64) []byte {
+	keyPrefix := fmt.Sprintf("t/%s/p/%d/m/", topicName, partitionID)
+	key := make([]byte, len(keyPrefix)+8)
+	copy(key, []byte(keyPrefix))
+	binary.BigEndian.PutUint64(key[len(keyPrefix):], offset)
+	return key
+}
+
+// GetOffsetFromKey extracts the offset from a message key.
+func GetOffsetFromKey(key []byte, prefixLen int) (uint64, error) {
+	if len(key) != prefixLen+8 {
+		return 0, fmt.Errorf("invalid key length: got %d, expected %d", len(key), prefixLen+8)
+	}
+	return binary.BigEndian.Uint64(key[prefixLen:]), nil
+}
+
+
+// AppendMessage adds a message to the partition's persistent log.
+func (p *Partition) AppendMessage(value string, priority string) (uint64, error) {
+	if p.offsetSeq == nil {
+		return 0, fmt.Errorf("sequence generator not initialized for partition %d", p.ID)
+	}
+	offset, err := p.offsetSeq.Next()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get next offset for p%d: %w", p.ID, err)
+	}
+
+	key := GenerateKey(p.TopicName, p.ID, offset)
+	msgData := StoredMessage{Value: value, Priority: priority}
+	valueBytes, err := json.Marshal(msgData)
+	if err != nil {
+		return 0, fmt.Errorf("failed to marshal message for p%d offset %d: %w", p.ID, offset, err)
+	}
+
+	err = p.db.Update(func(txn *badger.Txn) error {
+		return txn.Set(key, valueBytes)
+	})
+	if err != nil {
+		log.Printf("WARN: Failed to write message for p%d at offset %d after getting sequence number: %v", p.ID, offset, err)
+		return 0, fmt.Errorf("failed BadgerDB update for p%d offset %d: %w", p.ID, offset, err)
+	}
+	return offset, nil
+}
+
+
+// ReadMessages reads a batch of messages starting from a given offset.
+func (p *Partition) ReadMessages(startOffset uint64, batchSize int) ([]StoredMessage, uint64, error) {
+	messages := make([]StoredMessage, 0, batchSize)
+	var nextOffset uint64 = startOffset
+
+	err := p.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = true
+		opts.PrefetchSize = batchSize * 2 // Prefetch more
+
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		keyPrefixBytes := []byte(fmt.Sprintf("t/%s/p/%d/m/", p.TopicName, p.ID))
+		startKey := GenerateKey(p.TopicName, p.ID, startOffset)
+
+		lastProcessedOffset := startOffset - 1
+
+		it.Seek(startKey)
+
+		for ; it.ValidForPrefix(keyPrefixBytes) && len(messages) < batchSize; it.Next() {
+			item := it.Item()
+			key := item.Key()
+
+			currentKeyOffset, err := GetOffsetFromKey(key, len(keyPrefixBytes))
+			if err != nil {
+				log.Printf("WARN: Skipping key with unexpected format in p%d: %s (%v)", p.ID, key, err)
+				continue
+			}
+
+			var msg StoredMessage
+			err = item.Value(func(val []byte) error {
+				if err := json.Unmarshal(val, &msg); err != nil {
+					log.Printf("WARN: Failed to unmarshal message at p%d offset %d: %v", p.ID, currentKeyOffset, err)
+					return nil // Treat as skippable
+				}
+				return nil
+			})
+			if err != nil {
+				return fmt.Errorf("error reading value for p%d offset %d: %w", p.ID, currentKeyOffset, err)
+			}
+
+            if msg.Value == "" && msg.Priority == "" { // Check if unmarshal failed silently
+                 continue
+            }
+
+			msg.Offset = currentKeyOffset
+			messages = append(messages, msg)
+			lastProcessedOffset = currentKeyOffset
+		}
+		// Determine the offset for the *next* read
+		nextOffset = lastProcessedOffset + 1
+		return nil
+	})
+
+	if err != nil {
+		return nil, startOffset, fmt.Errorf("failed during batch read for p%d: %w", p.ID, err)
+	}
+	return messages, nextOffset, nil
+}
+
+// --- Helper Functions ---
+
+// combineMessages is REMOVED FOR ISSUE #2 (no longer needed)
+
+// min returns the smaller of two integers (Keep as is)
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -142,30 +338,82 @@ func min(a, b int) int {
 // --- Main Function ---
 
 func main() {
-	fmt.Println("Starting Gin router...")
-	r := gin.Default()
+	fmt.Println("Starting FalconQ Broker...")
+
+	// --- Initialize BadgerDB ---
+	dbPath := "falconq_data"
+	fmt.Printf("Opening BadgerDB at path: %s\n", dbPath)
+	opts := badger.DefaultOptions(dbPath).WithLogger(nil)
+	db, err := badger.Open(opts)
+	if err != nil {
+		log.Fatalf("❌ Failed to open BadgerDB: %v", err)
+	}
+	// No defer db.Close() here - use graceful shutdown
+
+	// --- Initialize Broker ---
+	broker = NewBroker(db) // Initialize global broker instance
+	fmt.Println("Broker initialized.")
+
+	// --- Setup Gin Router ---
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+	r.Use(gin.Logger())
+	r.Use(gin.Recovery())
 
 	// === API Endpoints ===
-	// Core Pub/Sub
 	r.POST("/topic/:topic/publish", handlePublish)
 	r.GET("/topic/:topic/peek", handlePeek)
 	r.GET("/topic/:topic/consume", handleConsume)
-
-	// Introspection/Admin
 	r.GET("/topics", handleGetTopics)
 	r.GET("/topics/:topic/partitions", handleGetPartitions)
 
-	// === Start Server ===
+	// === Start HTTP Server (Graceful Shutdown) ===
 	port := ":8080"
-	fmt.Printf("Broker API running at http://localhost%s\n", port)
-	if err := r.Run(port); err != nil {
-		fmt.Printf("Error starting server: %v\n", err)
+	srv := &http.Server{
+		Addr:    port,
+		Handler: r,
 	}
+
+	go func() {
+		fmt.Printf("🚀 FalconQ Broker API running at http://localhost%s\n", port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("listen: %s\n", err)
+		}
+	}()
+
+	// --- Graceful Shutdown Handling ---
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Println("🚦 Shutting down server...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatal("❌ Server forced to shutdown:", err)
+	}
+
+	// --- Close Broker Resources ---
+	log.Println("🧹 Closing broker resources...")
+	if broker != nil { // Check if broker was initialized
+		if err := broker.Close(); err != nil {
+			log.Printf("❌ Error closing broker resources: %v\n", err)
+		} else {
+			log.Println("✅ Broker resources closed.")
+		}
+	} else {
+        // If broker is nil, still try to close DB if it was opened
+        if db != nil {
+             db.Close()
+        }
+    }
+
+	log.Println("👋 Server exiting")
 }
 
 // --- Request Handlers ---
 
-// handlePublish adds a message to the appropriate partition (currently always partition 0).
+// handlePublish (MODIFIED FOR ISSUE #2)
 func handlePublish(c *gin.Context) {
 	topicName := c.Param("topic")
 
@@ -180,38 +428,41 @@ func handlePublish(c *gin.Context) {
 	}
 
 	topic := broker.getOrCreateTopic(topicName)
-	// TODO: Implement partitioning logic here instead of hardcoding 0
-	partitionID := 0
-	partition := topic.getOrCreatePartition(partitionID)
-
-	partition.mu.Lock()
-	if msg.Priority == "high" {
-		partition.HighMessages = append(partition.HighMessages, msg.Value)
-	} else {
-		partition.LowMessages = append(partition.LowMessages, msg.Value)
+	partitionID := 0 // TODO: Partitioning logic
+	partition, err := topic.getOrCreatePartition(partitionID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to access partition", err.Error()))
+		return
 	}
-	partition.mu.Unlock()
 
-	fmt.Printf("📤 Added %s priority to '%s' [P%d]: %s\n", msg.Priority, topicName, partitionID, msg.Value)
+	// Use the new AppendMessage method
+	offset, err := partition.AppendMessage(msg.Value, msg.Priority)
+	if err != nil {
+		log.Printf("❌ Failed to append message to topic '%s' p%d: %v", topicName, partitionID, err)
+		c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to store message", err.Error()))
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"status":      "message received",
 		"topic":       topicName,
 		"partitionID": partitionID,
-		"message":     msg.Value,
+		"offset":      offset, // Return persistent offset
 		"priority":    msg.Priority,
+		// "message":     msg.Value, // Optionally omit echo-back
 	})
 }
 
-// handlePeek reads messages after an offset without consuming. Uses Read Lock.
+// handlePeek (MODIFIED FOR ISSUE #2)
 func handlePeek(c *gin.Context) {
 	topicName := c.Param("topic")
-	// TODO: Allow specifying partitionID in query later
-	partitionID := 0
+	partitionID := 0 // TODO: Partitioning logic
 	offsetQuery := c.DefaultQuery("offset", "0")
 	batchQuery := c.DefaultQuery("batch", "1")
 
-	currentOffset, err := strconv.Atoi(offsetQuery)
-	if err != nil || currentOffset < 0 {
+	// *** Use ParseUint for offset ***
+	startOffset, err := strconv.ParseUint(offsetQuery, 10, 64)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Invalid offset value", "Offset must be a non-negative integer"))
 		return
 	}
@@ -221,53 +472,59 @@ func handlePeek(c *gin.Context) {
 		return
 	}
 
-	broker.mu.RLock()
-	topic, topicExists := broker.Topics[topicName]
-	broker.mu.RUnlock()
-	if !topicExists {
-		c.JSON(http.StatusNotFound, NewApiError("NotFoundError", "Topic not found", fmt.Sprintf("Topic '%s' does not exist", topicName)))
+	topic := broker.getOrCreateTopic(topicName)
+	partition, err := topic.getOrCreatePartition(partitionID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to access partition", err.Error()))
 		return
 	}
 
-	topic.mu.RLock()
-	partition, partitionExists := topic.Partitions[partitionID]
-	topic.mu.RUnlock()
-	if !partitionExists {
-		// If the topic exists but partition 0 doesn't (edge case?), treat as empty
-		c.JSON(http.StatusOK, gin.H{"topic": topicName, "partitionID": partitionID, "messages": []string{}, "nextOffset": currentOffset, "info": "partition not found or empty"})
+	// Read raw batch from BadgerDB using new method
+	rawMessages, nextOffsetRead, err := partition.ReadMessages(startOffset, batchSize)
+	if err != nil {
+		log.Printf("❌ Failed to read messages for peek on topic '%s' p%d: %v", topicName, partitionID, err)
+		c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to read messages", err.Error()))
 		return
 	}
 
-	partition.mu.RLock()
-	combinedMessages := partition.combineMessages()
-	totalAvailable := len(combinedMessages)
-	partition.mu.RUnlock()
-
-	if currentOffset >= totalAvailable {
-		c.JSON(http.StatusOK, gin.H{"topic": topicName, "partitionID": partitionID, "messages": []string{}, "nextOffset": currentOffset, "info": "no new messages available at this offset"})
-		return
+	// Priority Filtering (applied after reading)
+	messagesToSend := make([]StoredMessage, 0, len(rawMessages))
+	for _, msg := range rawMessages { // High first
+		if msg.Priority == "high" {
+			messagesToSend = append(messagesToSend, msg)
+		}
+	}
+	for _, msg := range rawMessages { // Then low, up to batch size
+		if len(messagesToSend) >= batchSize { break }
+		if msg.Priority == "low" {
+			messagesToSend = append(messagesToSend, msg)
+		}
 	}
 
-	endIndex := min(currentOffset+batchSize, totalAvailable)
-	messagesToSend := combinedMessages[currentOffset:endIndex]
-	nextOffset := endIndex
+	// Determine client's next offset based on actual last message sent
+	finalClientNextOffset := startOffset
+	if len(messagesToSend) > 0 {
+		finalClientNextOffset = messagesToSend[len(messagesToSend)-1].Offset + 1
+	} else {
+		finalClientNextOffset = nextOffsetRead // Use offset after last *read* if nothing sent
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"topic":       topicName,
 		"partitionID": partitionID,
-		"messages":    messagesToSend,
-		"startOffset": currentOffset,
+		"messages":    messagesToSend, // Return StoredMessage including offset
+		"startOffset": startOffset,
 		"count":       len(messagesToSend),
-		"nextOffset":  nextOffset,
+		"nextOffset":  finalClientNextOffset,
 	})
 }
 
-// handleConsume reads messages for a consumer, updating offset. Uses Write Lock.
+
+// handleConsume (MODIFIED FOR ISSUE #2)
 func handleConsume(c *gin.Context) {
 	topicName := c.Param("topic")
 	consumerID := c.Query("consumerID")
-	// TODO: Allow specifying partitionID in query later
-	partitionID := 0
+	partitionID := 0 // TODO: Partitioning logic
 	batchQuery := c.DefaultQuery("batch", "1")
 
 	if consumerID == "" {
@@ -280,79 +537,86 @@ func handleConsume(c *gin.Context) {
 		return
 	}
 
-	broker.mu.RLock()
-	topic, topicExists := broker.Topics[topicName]
-	broker.mu.RUnlock()
-	if !topicExists {
-		c.JSON(http.StatusNotFound, NewApiError("NotFoundError", "Topic not found", fmt.Sprintf("Topic '%s' does not exist", topicName)))
+	topic := broker.getOrCreateTopic(topicName)
+	partition, err := topic.getOrCreatePartition(partitionID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to access partition", err.Error()))
 		return
 	}
 
-	topic.mu.RLock()
-	partition, partitionExists := topic.Partitions[partitionID]
-	topic.mu.RUnlock()
-	if !partitionExists {
-		// If the partition doesn't exist, the consumer's effective offset for it is 0.
-		// No need to check the old global offsetStore.
-		currentOffset := 0
-		c.JSON(http.StatusOK, gin.H{"consumerID": consumerID, "topic": topicName, "partitionID": partitionID, "messages": []string{}, "nextOffset": currentOffset, "info": "partition not found or empty"})
+	// Get Current Offset (use RLock)
+	partition.mu.RLock()
+	// *** Use uint64 for offset ***
+	currentConsumerOffset := partition.ConsumerOffsets[consumerID] // Defaults to 0
+	partition.mu.RUnlock()
+
+	// Read Raw Batch
+	rawMessages, nextOffsetRead, err := partition.ReadMessages(currentConsumerOffset, batchSize)
+	if err != nil {
+		log.Printf("❌ Failed to read messages for consume on topic '%s' p%d for consumer '%s': %v", topicName, partitionID, consumerID, err)
+		c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to read messages", err.Error()))
 		return
 	}
 
-	partition.mu.Lock() // Need Write lock to update offset
-	defer partition.mu.Unlock()
-
-	currentOffset := partition.ConsumerOffsets[consumerID] // Defaults to 0 if consumerID is new for this partition
-	combinedMessages := partition.combineMessages()
-	totalAvailable := len(combinedMessages)
-
-	if currentOffset >= totalAvailable {
-		c.JSON(http.StatusOK, gin.H{"consumerID": consumerID, "topic": topicName, "partitionID": partitionID, "messages": []string{}, "nextOffset": currentOffset, "info": "no new messages available for consumer"})
-		return
+	// Priority Filtering
+	messagesToSend := make([]StoredMessage, 0, len(rawMessages))
+	for _, msg := range rawMessages { // High first
+		if msg.Priority == "high" {
+			messagesToSend = append(messagesToSend, msg)
+		}
+	}
+	for _, msg := range rawMessages { // Then low, up to batch size
+		if len(messagesToSend) >= batchSize { break }
+		if msg.Priority == "low" {
+			messagesToSend = append(messagesToSend, msg)
+		}
 	}
 
-	endIndex := min(currentOffset+batchSize, totalAvailable)
-	messagesToSend := combinedMessages[currentOffset:endIndex]
-	nextOffset := endIndex
+	// Determine and Update Consumer Offset (use Lock)
+	var finalConsumerNextOffset uint64
+	if len(messagesToSend) > 0 {
+		finalConsumerNextOffset = messagesToSend[len(messagesToSend)-1].Offset + 1
+	} else {
+		finalConsumerNextOffset = nextOffsetRead // If nothing sent, consumer should retry from offset after last read item
+	}
 
-	// Update offset for this consumer *under lock*
-	partition.ConsumerOffsets[consumerID] = nextOffset
+	partition.mu.Lock()
+	partition.ConsumerOffsets[consumerID] = finalConsumerNextOffset // Store uint64 offset
+	partition.mu.Unlock()
 
 	c.JSON(http.StatusOK, gin.H{
 		"consumerID":  consumerID,
 		"topic":       topicName,
 		"partitionID": partitionID,
 		"messages":    messagesToSend,
-		"startOffset": currentOffset,
+		"startOffset": currentConsumerOffset,
 		"count":       len(messagesToSend),
-		"nextOffset":  nextOffset,
+		"nextOffset":  finalConsumerNextOffset, // Consumer's offset for *next* request
 	})
 }
 
-// handleGetTopics lists all available topic names.
+
+// handleGetTopics (Keep as is)
 func handleGetTopics(c *gin.Context) {
 	broker.mu.RLock()
 	defer broker.mu.RUnlock()
-
 	topicNames := make([]string, 0, len(broker.Topics))
 	for name := range broker.Topics {
 		topicNames = append(topicNames, name)
 	}
-	sort.Strings(topicNames) // Return in alphabetical order
-
+	sort.Strings(topicNames)
 	c.JSON(http.StatusOK, gin.H{"topics": topicNames})
 }
 
 // PartitionInfo provides summary data for a partition.
+// MODIFIED FOR ISSUE #2 - Removed counts
 type PartitionInfo struct {
-	ID         int `json:"id"`
-	HighCount  int `json:"highCount"`
-	LowCount   int `json:"lowCount"`
-	TotalCount int `json:"totalCount"`
-	// Could add consumer offset info here later if needed
+	ID int `json:"id"`
+	// Counts removed as they require iterating the DB partition, which is slow.
 }
 
-// handleGetPartitions lists partitions and their message counts for a given topic.
+// handleGetPartitions lists partitions for a given topic.
+// MODIFIED FOR ISSUE #2 - Simplified response
 func handleGetPartitions(c *gin.Context) {
 	topicName := c.Param("topic")
 
@@ -365,7 +629,7 @@ func handleGetPartitions(c *gin.Context) {
 		return
 	}
 
-	topic.mu.RLock() // Lock topic to safely iterate partitions map
+	topic.mu.RLock()
 	defer topic.mu.RUnlock()
 
 	partitionInfos := make([]PartitionInfo, 0, len(topic.Partitions))
@@ -373,21 +637,11 @@ func handleGetPartitions(c *gin.Context) {
 	for id := range topic.Partitions {
 		partitionIDs = append(partitionIDs, id)
 	}
-	sort.Ints(partitionIDs) // Ensure consistent ordering
+	sort.Ints(partitionIDs)
 
 	for _, id := range partitionIDs {
-		partition := topic.Partitions[id] // We know it exists as we're iterating keys
-		partition.mu.RLock() // Lock individual partition to read counts
-		highCount := len(partition.HighMessages)
-		lowCount := len(partition.LowMessages)
-		partition.mu.RUnlock()
-
-		partitionInfos = append(partitionInfos, PartitionInfo{
-			ID:         id,
-			HighCount:  highCount,
-			LowCount:   lowCount,
-			TotalCount: highCount + lowCount,
-		})
+		// No need to lock individual partition just to get ID
+		partitionInfos = append(partitionInfos, PartitionInfo{ID: id})
 	}
 
 	c.JSON(http.StatusOK, gin.H{"topic": topicName, "partitions": partitionInfos})
