@@ -152,7 +152,7 @@ Observability: Planned Prometheus + Grafana
 
 
 👨‍💻 Author
-Sai Teja Kusireddy
+Sai Teja Kusireddy,
 Snehith Kongara
 
 
