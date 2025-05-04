@@ -57,9 +57,9 @@ FalconQ is a high-performance distributed message queue inspired by Apache Kafka
 | `GET`  | `/topics/:topic/partitions`                 | View partition IDs for a specific topic         |
 ---
 
-## 🧪 Example Usage (cURL)
+## 🧪 Example Usage (CURL)
 
-# Publish messages to the 'orders' topic
+### Publish messages to the 'orders' topic
 curl -X POST http://localhost:8080/topic/orders/publish \
   -H "Content-Type: application/json" \
   -d '{"message": "🔥 Urgent refund request #RF001", "priority": "high"}'
@@ -72,34 +72,36 @@ curl -X POST http://localhost:8080/topic/orders/publish \
   -H "Content-Type: application/json" \
   -d '{"message": "🔥 Critical stock update #SKU001", "priority": "high"}'
 
-# Consume messages for consumer 'worker1' (gets high priority first)
-# First call:
+### Consume messages for consumer 'worker1' (gets high priority first)
+### First call:
 curl "http://localhost:8080/topic/orders/consume?consumerID=worker1&batch=2"
-# Example Response: 
+### Example Response: 
 [{"v":"🔥 Urgent refund request #RF001","p":"high","Offset":0},{"v":"🔥 Critical stock update #SKU001","p":"high","Offset":2}], nextOffset: 3
 
-# Second call (will get low priority if available):
+### Second call (will get low priority if available):
 curl "http://localhost:8080/topic/orders/consume?consumerID=worker1&batch=2"
-# Example Response: 
+### Example Response: 
 [{"v":"🧊 Normal order placement #ORD001","p":"low","Offset":1}], nextOffset: 2 (Note: actual offset depends on internal filtering)
 
 
-# Peek messages starting from offset 0 (gets high priority first)
+### Peek messages starting from offset 0 (gets high priority first)
 curl "http://localhost:8080/topic/orders/peek?offset=0&batch=5"
 
-# View topics/partitions
+### View topics/partitions
 curl http://localhost:8080/topics
-# Example Response: {"topics":["orders"]}
+### Example Response: {"topics":["orders"]}
 
 curl http://localhost:8080/topics/orders/partitions
-# Example Response: {"partitions":[{"id":0}],"topic":"orders"}
+### Example Response: {"partitions":[{"id":0}],"topic":"orders"}
 
 
 
-🧠 Architecture mermaid
+🧠 Architecture 
+
 
 Architecture below illustrates how messages flow from REST → Broker → BadgerDB
 
+```mermaid
 graph TD
   subgraph User Facing API (Gin)
     Publish[POST /topic/:topic/publish]  
@@ -108,22 +110,23 @@ graph TD
     Topics[GET /topics]  
     Partitions[GET /topics/:topic/partitions]  
   end
+```
 
+```mermaid
+graph TD
   subgraph Broker Logic (Go)
-    Broker -- Manages --> TopicsMap{Topics Map}
-
+    Broker -- Manages --> TopicsMap{{Topics Map }}
     TopicsMap --> TopicOrders(Topic: orders)
     TopicsMap --> TopicPayments(Topic: payments)
-
     TopicOrders -- Contains --> Partition0Orders(Partition 0)
     TopicPayments -- Contains --> Partition0Payments(Partition 0)
-
     Partition0Orders -- Manages --> OffsetsOrders[In-Memory Consumer Offsets]
     Partition0Orders -- Writes/Reads Log --> BadgerDB[(BadgerDB Persistent KV Store)]
-
     Partition0Payments -- Manages --> OffsetsPayments[In-Memory Consumer Offsets]
     Partition0Payments -- Writes/Reads Log --> BadgerDB
   end
+```
+
 
    BadgerDB 
 
