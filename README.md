@@ -125,7 +125,7 @@ graph TD
     Partition0Payments -- Writes/Reads Log --> BadgerDB
   end
 
-  style BadgerDB fill:#f9f,stroke:#333,stroke-width:2px
+
 
   Publish --> Broker
   Peek --> Broker
