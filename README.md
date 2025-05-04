@@ -103,19 +103,19 @@ Architecture below illustrates how messages flow from REST → Broker → Badger
 
 ```mermaid
 graph TD
-  subgraph User Facing API (Gin)
-    Publish[POST /topic/:topic/publish]  
-    Peek[GET /topic/:topic/peek]  
-    Consume[GET /topic/:topic/consume]  
-    Topics[GET /topics]  
-    Partitions[GET /topics/:topic/partitions]  
+  subgraph "User Facing API - Gin"
+    Publish[POST /topic/:topic/publish]
+    Peek[GET /topic/:topic/peek]
+    Consume[GET /topic/:topic/consume]
+    Topics[GET /topics]
+    Partitions[GET /topics/:topic/partitions]
   end
 ```
 
 ```mermaid
 graph TD
-  subgraph Broker Logic (Go)
-    Broker -- Manages --> TopicsMap{{Topics Map }}
+  subgraph "Broker Logic - Go"
+    Broker -- Manages --> TopicsMap{{Topics Map}}
     TopicsMap --> TopicOrders(Topic: orders)
     TopicsMap --> TopicPayments(Topic: payments)
     TopicOrders -- Contains --> Partition0Orders(Partition 0)
@@ -126,6 +126,7 @@ graph TD
     Partition0Payments -- Writes/Reads Log --> BadgerDB
   end
 ```
+
 
 
    BadgerDB 
