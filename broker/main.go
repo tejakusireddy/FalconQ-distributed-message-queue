@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -17,13 +18,17 @@ import (
 	"syscall"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/dgraph-io/badger/v4"
 	"github.com/gin-gonic/gin"
 	"github.com/stathat/consistent"
 )
 
 const DefaultNumPartitions = 3 // Default partitions per topic
-const MaxNumPartitions = 256  // Safety limit for partitions
+const MaxNumPartitions = 256   // Safety limit for partitions
+
+var cluster *ClusterManager
 
 // --- API Error Structure ---
 type ApiError struct {
@@ -41,7 +46,7 @@ func NewApiError(errType, message, details string) ApiError {
 // Message defines the structure for incoming API messages
 type Message struct {
 	Value        string  `json:"message"`
-	Priority     string  `json:"priority"` // Expected: "high" or "low"
+	Priority     string  `json:"priority"`               // Expected: "high" or "low"
 	PartitionKey *string `json:"partitionKey,omitempty"` // Optional key for hashing
 }
 
@@ -75,8 +80,8 @@ type Topic struct {
 // Broker manages topics.
 type Broker struct {
 	Topics map[string]*Topic // map[topicName]*Topic
-	mu     sync.RWMutex    // Protects Topics map
-	db     *badger.DB      // Holds the BadgerDB instance
+	mu     sync.RWMutex      // Protects Topics map
+	db     *badger.DB        // Holds the BadgerDB instance
 }
 
 // --- Global Broker Instance ---
@@ -107,7 +112,7 @@ func NewTopic(name string, db *badger.DB, numPartitions int) (*Topic, error) {
 	}
 	hashRing := consistent.New()
 	hashRing.NumberOfReplicas = 20 // More replicas for better distribution
-	hashRing.Set(members)           // Add partitions "0", "1", ..., "N-1"
+	hashRing.Set(members)          // Add partitions "0", "1", ..., "N-1"
 
 	return &Topic{
 		Name:          name,
@@ -386,22 +391,86 @@ func (p *Partition) SetConsumerOffset(consumerID string, offset uint64) error {
 }
 
 // --- Helper Functions ---
-func min(a, b int) int { if a < b { return a }; return b }
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
 
 // --- Main Function ---
 func main() {
-	fmt.Println("Starting FalconQ Broker..."); dbPath := "falconq_data"; fmt.Printf("Opening BadgerDB at path: %s\n", dbPath)
-	opts := badger.DefaultOptions(dbPath).WithLogger(nil); db, err := badger.Open(opts); if err != nil { log.Fatalf("❌ Failed to open BadgerDB: %v", err) }
-	broker = NewBroker(db); fmt.Println("Broker initialized.")
-	gin.SetMode(gin.ReleaseMode); r := gin.New(); r.Use(gin.Logger()); r.Use(gin.Recovery())
-	r.POST("/topic/:topic/publish", handlePublish); r.GET("/topic/:topic/peek", handlePeek); r.GET("/topic/:topic/consume", handleConsume)
-	r.GET("/topics", handleGetTopics); r.GET("/topics/:topic/partitions", handleGetPartitions)
-	port := ":8080"; srv := &http.Server{ Addr: port, Handler: r }
-	go func() { fmt.Printf("🚀 FalconQ Broker API running at http://localhost%s\n", port); if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed { log.Fatalf("listen: %s\n", err) } }()
-	quit := make(chan os.Signal, 1); signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM); <-quit
-	log.Println("🚦 Shutting down server..."); ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second); defer cancel()
-	if err := srv.Shutdown(ctx); err != nil { log.Fatal("❌ Server forced to shutdown:", err) }
-	log.Println("🧹 Closing broker resources..."); if broker != nil { if err := broker.Close(); err != nil { log.Printf("❌ Error closing broker resources: %v\n", err) } else { log.Println("✅ Broker resources closed.") } } else { if db != nil { db.Close() } }
+	fmt.Println("Starting FalconQ Broker...")
+
+	configPath := flag.String("config", "config.yaml", "Path to config file")
+
+	flag.Parse()
+
+	// Load config.yaml
+	cfg, err := LoadConfig(*configPath)
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	// Initialize cluster
+	cluster = NewClusterManager(cfg)
+
+	// Open DB
+	// dbPath := "falconq_data"
+	dbPath := fmt.Sprintf("falconq_data_%s", cfg.NodeID)
+	port := fmt.Sprintf(":%d", cfg.HTTPPort)
+
+	fmt.Printf("Opening BadgerDB at path: %s\n", dbPath)
+	opts := badger.DefaultOptions(dbPath).WithLogger(nil)
+	db, err := badger.Open(opts)
+	if err != nil {
+		log.Fatalf("❌ Failed to open BadgerDB: %v", err)
+	}
+	broker = NewBroker(db)
+	fmt.Println("Broker initialized.")
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+	r.Use(gin.Logger())
+	r.Use(gin.Recovery())
+
+	// 🔁 Register replication handler before starting server
+	r.POST("/internal/replicate", handleReplication)
+
+	r.POST("/topic/:topic/publish", handlePublish)
+	r.GET("/topic/:topic/peek", handlePeek)
+	r.GET("/topic/:topic/consume", handleConsume)
+	r.GET("/topics", handleGetTopics)
+	r.GET("/topics/:topic/partitions", handleGetPartitions)
+	// port := ":8080"
+
+	srv := &http.Server{Addr: port, Handler: r}
+	go func() {
+		fmt.Printf("🚀 FalconQ Broker API running at http://localhost%s\n", port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("listen: %s\n", err)
+		}
+	}()
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Println("🚦 Shutting down server...")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatal("❌ Server forced to shutdown:", err)
+	}
+	log.Println("🧹 Closing broker resources...")
+	if broker != nil {
+		if err := broker.Close(); err != nil {
+			log.Printf("❌ Error closing broker resources: %v\n", err)
+		} else {
+			log.Println("✅ Broker resources closed.")
+		}
+	} else {
+		if db != nil {
+			db.Close()
+		}
+	}
 	log.Println("👋 Server exiting")
 }
 
@@ -472,31 +541,68 @@ func handlePeek(c *gin.Context) {
 	partitionIDStr := c.DefaultQuery("partitionID", "-1")
 
 	startOffset, err := strconv.ParseUint(offsetQuery, 10, 64)
-	if err != nil { c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Invalid offset value", "Offset must be a non-negative integer")); return }
+	if err != nil {
+		c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Invalid offset value", "Offset must be a non-negative integer"))
+		return
+	}
 	batchSize, err := strconv.Atoi(batchQuery)
-	if err != nil || batchSize <= 0 { c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Invalid batch size", "Batch size must be a positive integer")); return }
+	if err != nil || batchSize <= 0 {
+		c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Invalid batch size", "Batch size must be a positive integer"))
+		return
+	}
 	partitionID, err := strconv.Atoi(partitionIDStr)
-	if err != nil || partitionID < 0 { c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Missing or invalid partitionID", "partitionID query parameter (non-negative integer) is required for peek/consume")); return }
+	if err != nil || partitionID < 0 {
+		c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Missing or invalid partitionID", "partitionID query parameter (non-negative integer) is required for peek/consume"))
+		return
+	}
 
 	topic, err := broker.getOrCreateTopic(topicName)
-	if err != nil { c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to access topic", err.Error())); return }
-	if partitionID >= topic.NumPartitions { c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Invalid partitionID", fmt.Sprintf("Partition ID must be less than %d for topic %s", topic.NumPartitions, topicName))); return }
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to access topic", err.Error()))
+		return
+	}
+	if partitionID >= topic.NumPartitions {
+		c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Invalid partitionID", fmt.Sprintf("Partition ID must be less than %d for topic %s", topic.NumPartitions, topicName)))
+		return
+	}
 
 	partition, err := topic.getOrCreatePartition(partitionID)
-	if err != nil { c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to access specified partition", err.Error())); return }
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to access specified partition", err.Error()))
+		return
+	}
 
 	// Read raw batch from the specified partition
 	rawMessages, nextOffsetRead, err := partition.ReadMessages(startOffset, batchSize)
-	if err != nil { log.Printf("❌ Failed to read messages for peek on topic '%s' p%d: %v", topicName, partitionID, err); c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to read messages", err.Error())); return }
+	if err != nil {
+		log.Printf("❌ Failed to read messages for peek on topic '%s' p%d: %v", topicName, partitionID, err)
+		c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to read messages", err.Error()))
+		return
+	}
 
 	// Priority Filtering
 	messagesToSend := make([]StoredMessage, 0, len(rawMessages))
-	for _, msg := range rawMessages { if msg.Priority == "high" { messagesToSend = append(messagesToSend, msg) } }
-	for _, msg := range rawMessages { if len(messagesToSend) >= batchSize { break }; if msg.Priority == "low" { messagesToSend = append(messagesToSend, msg) } }
+	for _, msg := range rawMessages {
+		if msg.Priority == "high" {
+			messagesToSend = append(messagesToSend, msg)
+		}
+	}
+	for _, msg := range rawMessages {
+		if len(messagesToSend) >= batchSize {
+			break
+		}
+		if msg.Priority == "low" {
+			messagesToSend = append(messagesToSend, msg)
+		}
+	}
 
 	// Determine client's next offset based on actual last message sent
 	finalClientNextOffset := startOffset
-	if len(messagesToSend) > 0 { finalClientNextOffset = messagesToSend[len(messagesToSend)-1].Offset + 1 } else { finalClientNextOffset = nextOffsetRead }
+	if len(messagesToSend) > 0 {
+		finalClientNextOffset = messagesToSend[len(messagesToSend)-1].Offset + 1
+	} else {
+		finalClientNextOffset = nextOffsetRead
+	}
 
 	c.JSON(http.StatusOK, gin.H{"topic": topicName, "partitionID": partitionID, "messages": messagesToSend, "startOffset": startOffset, "count": len(messagesToSend), "nextOffset": finalClientNextOffset})
 }
@@ -507,33 +613,76 @@ func handleConsume(c *gin.Context) {
 	batchQuery := c.DefaultQuery("batch", "1")
 	partitionIDStr := c.DefaultQuery("partitionID", "-1")
 
-	if consumerID == "" { c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Missing consumerID", "consumerID query parameter is required")); return }
-	batchSize, err := strconv.Atoi(batchQuery); if err != nil || batchSize <= 0 { c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Invalid batch size", "Batch size must be a positive integer")); return }
-	partitionID, err := strconv.Atoi(partitionIDStr); if err != nil || partitionID < 0 { c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Missing or invalid partitionID", "partitionID query parameter (non-negative integer) is required for peek/consume")); return }
+	if consumerID == "" {
+		c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Missing consumerID", "consumerID query parameter is required"))
+		return
+	}
+	batchSize, err := strconv.Atoi(batchQuery)
+	if err != nil || batchSize <= 0 {
+		c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Invalid batch size", "Batch size must be a positive integer"))
+		return
+	}
+	partitionID, err := strconv.Atoi(partitionIDStr)
+	if err != nil || partitionID < 0 {
+		c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Missing or invalid partitionID", "partitionID query parameter (non-negative integer) is required for peek/consume"))
+		return
+	}
 
 	topic, err := broker.getOrCreateTopic(topicName)
-	if err != nil { c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to access topic", err.Error())); return }
-	if partitionID >= topic.NumPartitions { c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Invalid partitionID", fmt.Sprintf("Partition ID must be less than %d for topic %s", topic.NumPartitions, topicName))); return }
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to access topic", err.Error()))
+		return
+	}
+	if partitionID >= topic.NumPartitions {
+		c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Invalid partitionID", fmt.Sprintf("Partition ID must be less than %d for topic %s", topic.NumPartitions, topicName)))
+		return
+	}
 
 	partition, err := topic.getOrCreatePartition(partitionID)
-	if err != nil { c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to access specified partition", err.Error())); return }
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to access specified partition", err.Error()))
+		return
+	}
 
 	// Get Current Offset from BadgerDB
 	currentConsumerOffset, err := partition.GetConsumerOffset(consumerID)
-	if err != nil { log.Printf("❌ Failed to get consumer offset for consumer '%s' on topic '%s' p%d: %v", consumerID, topicName, partitionID, err); c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to retrieve consumer offset", err.Error())); return }
+	if err != nil {
+		log.Printf("❌ Failed to get consumer offset for consumer '%s' on topic '%s' p%d: %v", consumerID, topicName, partitionID, err)
+		c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to retrieve consumer offset", err.Error()))
+		return
+	}
 
 	// Read Raw Batch
 	rawMessages, nextOffsetRead, err := partition.ReadMessages(currentConsumerOffset, batchSize)
-	if err != nil { log.Printf("❌ Failed to read messages for consume on topic '%s' p%d for consumer '%s': %v", topicName, partitionID, consumerID, err); c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to read messages", err.Error())); return }
+	if err != nil {
+		log.Printf("❌ Failed to read messages for consume on topic '%s' p%d for consumer '%s': %v", topicName, partitionID, consumerID, err)
+		c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to read messages", err.Error()))
+		return
+	}
 
 	// Priority Filtering
 	messagesToSend := make([]StoredMessage, 0, len(rawMessages))
-	for _, msg := range rawMessages { if msg.Priority == "high" { messagesToSend = append(messagesToSend, msg) } }
-	for _, msg := range rawMessages { if len(messagesToSend) >= batchSize { break }; if msg.Priority == "low" { messagesToSend = append(messagesToSend, msg) } }
+	for _, msg := range rawMessages {
+		if msg.Priority == "high" {
+			messagesToSend = append(messagesToSend, msg)
+		}
+	}
+	for _, msg := range rawMessages {
+		if len(messagesToSend) >= batchSize {
+			break
+		}
+		if msg.Priority == "low" {
+			messagesToSend = append(messagesToSend, msg)
+		}
+	}
 
 	// Determine and Update Consumer Offset in BadgerDB
 	var finalConsumerNextOffset uint64
-	if len(messagesToSend) > 0 { finalConsumerNextOffset = messagesToSend[len(messagesToSend)-1].Offset + 1 } else { finalConsumerNextOffset = nextOffsetRead }
+	if len(messagesToSend) > 0 {
+		finalConsumerNextOffset = messagesToSend[len(messagesToSend)-1].Offset + 1
+	} else {
+		finalConsumerNextOffset = nextOffsetRead
+	}
 
 	err = partition.SetConsumerOffset(consumerID, finalConsumerNextOffset)
 	if err != nil {
@@ -544,25 +693,127 @@ func handleConsume(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"consumerID": consumerID, "topic": topicName, "partitionID": partitionID, "messages": messagesToSend, "startOffset": currentConsumerOffset, "count": len(messagesToSend), "nextOffset": finalConsumerNextOffset})
 }
 
-
 // --- Admin Handlers ---
 
 func handleGetTopics(c *gin.Context) {
-	broker.mu.RLock(); defer broker.mu.RUnlock()
-	topicNames := make([]string, 0, len(broker.Topics)); for name := range broker.Topics { topicNames = append(topicNames, name) }
-	sort.Strings(topicNames); c.JSON(http.StatusOK, gin.H{"topics": topicNames})
+	broker.mu.RLock()
+	defer broker.mu.RUnlock()
+	topicNames := make([]string, 0, len(broker.Topics))
+	for name := range broker.Topics {
+		topicNames = append(topicNames, name)
+	}
+	sort.Strings(topicNames)
+	c.JSON(http.StatusOK, gin.H{"topics": topicNames})
 }
 
-type PartitionInfo struct { ID int `json:"id"` }
+type PartitionInfo struct {
+	ID int `json:"id"`
+}
 
 func handleGetPartitions(c *gin.Context) {
 	topicName := c.Param("topic")
-	broker.mu.RLock(); topic, topicExists := broker.Topics[topicName]; broker.mu.RUnlock()
-	if !topicExists { c.JSON(http.StatusNotFound, NewApiError("NotFoundError", "Topic not found", fmt.Sprintf("Topic '%s' does not exist", topicName))); return }
-	topic.mu.RLock(); defer topic.mu.RUnlock()
-	partitionInfos := make([]PartitionInfo, 0, len(topic.Partitions)); partitionIDs := make([]int, 0, len(topic.Partitions))
-	for id := range topic.Partitions { partitionIDs = append(partitionIDs, id) }
+	broker.mu.RLock()
+	topic, topicExists := broker.Topics[topicName]
+	broker.mu.RUnlock()
+	if !topicExists {
+		c.JSON(http.StatusNotFound, NewApiError("NotFoundError", "Topic not found", fmt.Sprintf("Topic '%s' does not exist", topicName)))
+		return
+	}
+	topic.mu.RLock()
+	defer topic.mu.RUnlock()
+	partitionInfos := make([]PartitionInfo, 0, len(topic.Partitions))
+	partitionIDs := make([]int, 0, len(topic.Partitions))
+	for id := range topic.Partitions {
+		partitionIDs = append(partitionIDs, id)
+	}
 	sort.Ints(partitionIDs)
-	for _, id := range partitionIDs { partitionInfos = append(partitionInfos, PartitionInfo{ID: id}) }
-	c.JSON(http.StatusOK, gin.H{ "topic": topicName, "configuredPartitions": topic.NumPartitions, "partitionKeyStrategy": "consistent_hash+round_robin_fallback", "activePartitions": partitionInfos })
+	for _, id := range partitionIDs {
+		partitionInfos = append(partitionInfos, PartitionInfo{ID: id})
+	}
+	c.JSON(http.StatusOK, gin.H{"topic": topicName, "configuredPartitions": topic.NumPartitions, "partitionKeyStrategy": "consistent_hash+round_robin_fallback", "activePartitions": partitionInfos})
+}
+
+// -- Replication across 3 Nodes
+
+type Peer struct {
+	ID      string `yaml:"id"`
+	Address string `yaml:"address"`
+}
+
+type Config struct {
+	NodeID   string `yaml:"node_id"`
+	HTTPPort int    `yaml:"http_port"`
+	Peers    []Peer `yaml:"peers"`
+}
+
+type ClusterManager struct {
+	NodeID string
+	Peers  map[string]string // map[peerID]address
+	Client *http.Client
+}
+
+func NewClusterManager(cfg *Config) *ClusterManager {
+	peers := make(map[string]string)
+	for _, p := range cfg.Peers {
+		peers[p.ID] = p.Address
+	}
+	return &ClusterManager{
+		NodeID: cfg.NodeID,
+		Peers:  peers,
+		Client: &http.Client{Timeout: 2 * time.Second},
+	}
+}
+
+func LoadConfig(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var cfg Config
+	err = yaml.Unmarshal(data, &cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+type ReplicationRequest struct {
+	Topic        string `json:"topic"`
+	PartitionID  int    `json:"partitionID"`
+	Value        string `json:"value"`
+	Priority     string `json:"priority"`
+	OriginNodeID string `json:"originNodeID"`
+}
+
+func handleReplication(c *gin.Context) {
+	var req ReplicationRequest
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Invalid replication request", err.Error()))
+		return
+	}
+
+	// Skip if replicated from self
+	if req.OriginNodeID == cluster.NodeID {
+		c.JSON(http.StatusOK, gin.H{"status": "ignored (from self)"})
+		return
+	}
+
+	topic, err := broker.getOrCreateTopic(req.Topic)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to access topic", err.Error()))
+		return
+	}
+	partition, err := topic.getOrCreatePartition(req.PartitionID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to access partition", err.Error()))
+		return
+	}
+	_, err = partition.AppendMessage(req.Value, req.Priority)
+	if err != nil {
+		log.Printf("❌ Replication append failed: %v", err)
+		c.JSON(http.StatusInternalServerError, NewApiError("ReplicationError", "Failed to append replicated message", err.Error()))
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "replicated"})
 }
