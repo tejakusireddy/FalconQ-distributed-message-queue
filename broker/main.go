@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -22,8 +23,6 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"gopkg.in/yaml.v3"
-
 	"github.com/dgraph-io/badger/v4"
 	"github.com/gin-gonic/gin"
 	"github.com/hashicorp/go-hclog"
@@ -32,10 +31,14 @@ import (
 	"github.com/stathat/consistent"
 )
 
-const DefaultNumPartitions = 3 // Default partitions per topic
-const MaxNumPartitions = 256   // Safety limit for partitions
+const (
+	DefaultNumPartitionsConstant = 3                   // Default partitions per topic if not specified
+	MaxNumPartitions             = 256                 // Safety limit for number of partitions
+	raftApplyTimeout             = 10 * time.Second    // Timeout for Raft Apply operations
+	raftDataDirBase              = "falconq_raft_data" // Base directory for Raft logs (per node)
+)
 
-var cluster *ClusterManager
+var broker *Broker // Global broker instance, initialized in main
 
 // --- API Error Structure ---
 type ApiError struct {
@@ -48,13 +51,14 @@ func NewApiError(errType, message, details string) ApiError {
 	return ApiError{Type: errType, Message: message, Details: details}
 }
 
-// --- Core Data Structures ---
-
-// Message defines the structure for incoming API messages
-type Message struct {
-	Value        string  `json:"message"`
-	Priority     string  `json:"priority"`               // Expected: "high" or "low"
-	PartitionKey *string `json:"partitionKey,omitempty"` // Optional key for hashing
+// --- Raft Command Structure ---
+type RaftCommand struct {
+	Operation string `json:"op"`        // e.g., "append"
+	Topic     string `json:"topic"`     // Topic name
+	Partition int    `json:"partition"` // Partition ID
+	Offset    uint64 `json:"offset"`    // Offset assigned by the LEADER
+	Value     string `json:"value"`     // Message content
+	Priority  string `json:"priority"`  // Message priority
 }
 
 // --- Core Data Structures ---
@@ -93,9 +97,12 @@ type Topic struct {
 }
 
 type Broker struct {
-	Topics map[string]*Topic // map[topicName]*Topic
-	mu     sync.RWMutex      // Protects Topics map
-	db     *badger.DB        // Holds the BadgerDB instance
+	Topics        map[string]*Topic
+	mu            sync.RWMutex
+	db            *badger.DB
+	Config        *Config                // Store global config here
+	NodeID        string                 // Current node's ID
+	RaftTransport *raft.NetworkTransport // Shared Raft transport for this node
 }
 
 // --- Raft FSM (Finite State Machine) ---
@@ -156,17 +163,9 @@ func NewTopic(name string, db *badger.DB, numPartitions int, cfg *Config, nodeID
 		members[i] = strconv.Itoa(i)
 	}
 	hashRing := consistent.New()
-	hashRing.NumberOfReplicas = 20 // More replicas for better distribution
-	hashRing.Set(members)          // Add partitions "0", "1", ..., "N-1"
-
-	return &Topic{
-		Name:          name,
-		Partitions:    make(map[int]*Partition),
-		mu:            sync.RWMutex{},
-		db:            db,
-		NumPartitions: numPartitions,
-		HashRing:      hashRing,
-	}, nil
+	hashRing.NumberOfReplicas = 20
+	hashRing.Set(members)
+	return &Topic{Name: name, Partitions: make(map[int]*Partition), mu: sync.RWMutex{}, db: db, Config: cfg, NodeID: nodeID, RaftTransport: transport, NumPartitions: numPartitions, HashRing: hashRing}, nil
 }
 func InitializePartition(id int, topicName string, db *badger.DB, cfg *Config, transport *raft.NetworkTransport) (*Partition, error) {
 	msgSeqKey := []byte(fmt.Sprintf("t/%s/p/%d/_msg_seq", topicName, id))
@@ -444,55 +443,150 @@ func min(a, b int) int {
 	}
 	return b
 }
+func getAdvertiseHost(cfg *Config) string {
+	ifaces, err := net.Interfaces()
+	if err == nil {
+		for _, i := range ifaces {
+			addrs, err := i.Addrs()
+			if err == nil {
+				for _, addr := range addrs {
+					var ip net.IP
+					switch v := addr.(type) {
+					case *net.IPNet:
+						ip = v.IP
+					case *net.IPAddr:
+						ip = v.IP
+					}
+					if ip != nil && !ip.IsLoopback() && ip.To4() != nil {
+						return ip.String()
+					}
+				}
+			}
+		}
+	}
+	if cfg.CurrentNode != nil {
+		host, _, _ := net.SplitHostPort(cfg.CurrentNode.HTTPAddress)
+		if host != "" && host != "localhost" && host != "127.0.0.1" && host != "::1" {
+			return host
+		}
+	}
+	return "127.0.0.1"
+}
+
+// --- Config Structs and Loading ---
+type NodeConfig struct {
+	HTTPAddress string `yaml:"http_address"`
+	RaftAddress string `yaml:"raft_address"`
+}
+type Config struct {
+	DefaultNumPartitions int                   `yaml:"default_num_partitions"`
+	Nodes                map[string]NodeConfig `yaml:"nodes"`
+	CurrentNodeID        string                `yaml:"-"`
+	CurrentNode          *NodeConfig           `yaml:"-"`
+}
+
+func LoadConfig(path string, currentNodeID string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read cfg %s: %w", path, err)
+	}
+	var cfg Config
+	err = yaml.Unmarshal(data, &cfg)
+	if err != nil {
+		return nil, fmt.Errorf("unmarshal cfg %s: %w", path, err)
+	}
+	cfg.CurrentNodeID = currentNodeID
+	nodeSpecificConfig, ok := cfg.Nodes[currentNodeID]
+	if !ok {
+		return nil, fmt.Errorf("node_id '%s' not in cfg nodes", currentNodeID)
+	}
+	cfg.CurrentNode = &nodeSpecificConfig
+	if cfg.CurrentNode.HTTPAddress == "" {
+		return nil, fmt.Errorf("http_address missing for node %s", currentNodeID)
+	}
+	if cfg.CurrentNode.RaftAddress == "" {
+		return nil, fmt.Errorf("raft_address missing for node %s", currentNodeID)
+	}
+	if cfg.DefaultNumPartitions == 0 {
+		cfg.DefaultNumPartitions = DefaultNumPartitionsConstant
+	}
+	return &cfg, nil
+}
+func (cfg *Config) GetPeerHTTPAddress(raftNodeAddress string) string { // raftNodeAddress is like "host:raft_port"
+	targetRaftHost, targetRaftPortStr, err := net.SplitHostPort(raftNodeAddress)
+	if err != nil {
+		log.Printf("ERROR: Invalid Raft node address format for lookup: %s", raftNodeAddress)
+		return ""
+	}
+	targetRaftPort, _ := strconv.Atoi(targetRaftPortStr)
+	for _, nodeCfg := range cfg.Nodes {
+		nodeRaftHost, nodeRaftPortStr, _ := net.SplitHostPort(nodeCfg.RaftAddress)
+		nodeRaftPort, _ := strconv.Atoi(nodeRaftPortStr)
+		isHostMatch := (nodeRaftHost == targetRaftHost) || (targetRaftHost == "127.0.0.1" && (nodeRaftHost == "localhost" || nodeRaftHost == "")) || (targetRaftHost == "localhost" && (nodeRaftHost == "127.0.0.1" || nodeRaftHost == ""))
+		if isHostMatch && nodeRaftPort == targetRaftPort {
+			return fmt.Sprintf("http://%s", nodeCfg.HTTPAddress)
+		}
+	}
+	log.Printf("WARN: Could not find peer config for Raft address %s", raftNodeAddress)
+	return ""
+}
 
 // --- Main Function ---
 func main() {
 	fmt.Println("Starting FalconQ Broker...")
-
 	configPath := flag.String("config", "config.yaml", "Path to config file")
-
+	nodeIDFlag := flag.String("nodeid", "", "This node's ID (must match a key in config.yaml nodes section)")
 	flag.Parse()
-
-	// Load config.yaml
-	cfg, err := LoadConfig(*configPath)
+	if *nodeIDFlag == "" {
+		log.Fatal("-nodeid flag is required")
+	}
+	cfg, err := LoadConfig(*configPath, *nodeIDFlag)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	// Initialize cluster
-	cluster = NewClusterManager(cfg)
+	raftBindAddr := cfg.CurrentNode.RaftAddress
+	raftAdvertiseHost := getAdvertiseHost(cfg)
+	_, raftAdvertisePortStr, _ := net.SplitHostPort(cfg.CurrentNode.RaftAddress)
+	raftAdvertiseAddrFull := fmt.Sprintf("%s:%s", raftAdvertiseHost, raftAdvertisePortStr)
+	raftAdvertiseNetAddr, err := net.ResolveTCPAddr("tcp", raftAdvertiseAddrFull)
+	if err != nil {
+		log.Fatalf("Resolve Raft advertise address %s: %v", raftAdvertiseAddrFull, err)
+	}
+	transport, err := raft.NewTCPTransport(raftBindAddr, raftAdvertiseNetAddr, 3, 10*time.Second, io.Discard)
+	if err != nil {
+		log.Fatalf("Create Raft transport: %v", err)
+	}
 
-	// Open DB
-	// dbPath := "falconq_data"
-	dbPath := fmt.Sprintf("falconq_data_%s", cfg.NodeID)
-	port := fmt.Sprintf(":%d", cfg.HTTPPort)
-
+	dbPath := fmt.Sprintf("falconq_data_%s", cfg.CurrentNodeID)
+	_, httpPortStr, _ := net.SplitHostPort(cfg.CurrentNode.HTTPAddress)
+	port := fmt.Sprintf(":%s", httpPortStr)
+	fmt.Printf("Node ID: %s | HTTP on: %s | Raft on: %s (Advertise: %s)\n", cfg.CurrentNodeID, cfg.CurrentNode.HTTPAddress, cfg.CurrentNode.RaftAddress, raftAdvertiseAddrFull)
 	fmt.Printf("Opening BadgerDB at path: %s\n", dbPath)
 	opts := badger.DefaultOptions(dbPath).WithLogger(nil)
 	db, err := badger.Open(opts)
 	if err != nil {
-		log.Fatalf("❌ Failed to open BadgerDB: %v", err)
+		log.Fatalf("❌ Open BadgerDB: %v", err)
 	}
-	broker = NewBroker(db)
+	broker = NewBroker(db, cfg, transport)
 	fmt.Println("Broker initialized.")
+	if _, err := broker.getOrCreateTopic("default-topic"); err != nil {
+		log.Printf("Error pre-creating default topic: %v", err)
+	} // Eagerly create a topic to start Raft groups
+
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Logger())
 	r.Use(gin.Recovery())
-
-	// 🔁 Register replication handler before starting server
-	r.POST("/internal/replicate", handleReplication)
-
 	r.POST("/topic/:topic/publish", handlePublish)
 	r.GET("/topic/:topic/peek", handlePeek)
 	r.GET("/topic/:topic/consume", handleConsume)
 	r.GET("/topics", handleGetTopics)
 	r.GET("/topics/:topic/partitions", handleGetPartitions)
-	// port := ":8080"
-
+	r.GET("/raft/stats", handleRaftStats)
 	srv := &http.Server{Addr: port, Handler: r}
 	go func() {
-		fmt.Printf("🚀 FalconQ Broker API running at http://localhost%s\n", port)
+		fmt.Printf("🚀 FalconQ Broker API for node %s running at http://%s | Raft on %s\n", cfg.CurrentNodeID, cfg.CurrentNode.HTTPAddress, cfg.CurrentNode.RaftAddress)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("listen: %s\n", err)
 		}
@@ -500,25 +594,23 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	log.Println("🚦 Shutting down server...")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	log.Printf("🚦 Shutting down server for node %s...", cfg.CurrentNodeID)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
-		log.Fatal("❌ Server forced to shutdown:", err)
+		log.Fatalf("❌ Server %s forced to shutdown: %v", cfg.CurrentNodeID, err)
 	}
-	log.Println("🧹 Closing broker resources...")
+	log.Printf("🧹 Closing broker resources for node %s...", cfg.CurrentNodeID)
 	if broker != nil {
 		if err := broker.Close(); err != nil {
-			log.Printf("❌ Error closing broker resources: %v\n", err)
+			log.Printf("❌ Error closing broker resources for %s: %v", cfg.CurrentNodeID, err)
 		} else {
-			log.Println("✅ Broker resources closed.")
+			log.Printf("✅ Broker resources for %s closed.", cfg.CurrentNodeID)
 		}
-	} else {
-		if db != nil {
-			db.Close()
-		}
+	} else if db != nil {
+		db.Close()
 	}
-	log.Println("👋 Server exiting")
+	log.Printf("👋 Server %s exiting", cfg.CurrentNodeID)
 }
 
 // --- Request Handlers ---
@@ -650,35 +742,29 @@ func handlePeek(c *gin.Context) {
 	}
 	partitionID, err := strconv.Atoi(partitionIDStr)
 	if err != nil || partitionID < 0 {
-		c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Missing or invalid partitionID", "partitionID query parameter (non-negative integer) is required for peek/consume"))
+		c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Missing or invalid partitionID", "partitionID query parameter is required"))
 		return
 	}
-
 	topic, err := broker.getOrCreateTopic(topicName)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to access topic", err.Error()))
 		return
 	}
 	if partitionID >= topic.NumPartitions {
-		c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Invalid partitionID", fmt.Sprintf("Partition ID must be less than %d for topic %s", topic.NumPartitions, topicName)))
+		c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Invalid partitionID", fmt.Sprintf("Partition ID must be < %d for topic %s", topic.NumPartitions, topicName)))
 		return
 	}
-
 	partition, err := topic.getOrCreatePartition(partitionID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to access specified partition", err.Error()))
 		return
 	}
-
-	// Read raw batch from the specified partition
 	rawMessages, nextOffsetRead, err := partition.ReadMessages(startOffset, batchSize)
 	if err != nil {
-		log.Printf("❌ Failed to read messages for peek on topic '%s' p%d: %v", topicName, partitionID, err)
+		log.Printf("❌ Read messages peek topic '%s' p%d: %v", topicName, partitionID, err)
 		c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to read messages", err.Error()))
 		return
 	}
-
-	// Priority Filtering
 	messagesToSend := make([]StoredMessage, 0, len(rawMessages))
 	for _, msg := range rawMessages {
 		if msg.Priority == "high" {
@@ -693,8 +779,6 @@ func handlePeek(c *gin.Context) {
 			messagesToSend = append(messagesToSend, msg)
 		}
 	}
-
-	// Determine client's next offset based on actual last message sent
 	finalClientNextOffset := startOffset
 	if len(messagesToSend) > 0 {
 		finalClientNextOffset = messagesToSend[len(messagesToSend)-1].Offset + 1
@@ -719,43 +803,35 @@ func handleConsume(c *gin.Context) {
 	}
 	partitionID, err := strconv.Atoi(partitionIDStr)
 	if err != nil || partitionID < 0 {
-		c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Missing or invalid partitionID", "partitionID query parameter (non-negative integer) is required for peek/consume"))
+		c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Missing or invalid partitionID", "partitionID query parameter is required"))
 		return
 	}
-
 	topic, err := broker.getOrCreateTopic(topicName)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to access topic", err.Error()))
 		return
 	}
 	if partitionID >= topic.NumPartitions {
-		c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Invalid partitionID", fmt.Sprintf("Partition ID must be less than %d for topic %s", topic.NumPartitions, topicName)))
+		c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Invalid partitionID", fmt.Sprintf("Partition ID must be < %d for topic %s", topic.NumPartitions, topicName)))
 		return
 	}
-
 	partition, err := topic.getOrCreatePartition(partitionID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to access specified partition", err.Error()))
 		return
 	}
-
-	// Get Current Offset from BadgerDB
 	currentConsumerOffset, err := partition.GetConsumerOffset(consumerID)
 	if err != nil {
-		log.Printf("❌ Failed to get consumer offset for consumer '%s' on topic '%s' p%d: %v", consumerID, topicName, partitionID, err)
+		log.Printf("❌ Get consumer offset consumer '%s' topic '%s' p%d: %v", consumerID, topicName, partitionID, err)
 		c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to retrieve consumer offset", err.Error()))
 		return
 	}
-
-	// Read Raw Batch
 	rawMessages, nextOffsetRead, err := partition.ReadMessages(currentConsumerOffset, batchSize)
 	if err != nil {
-		log.Printf("❌ Failed to read messages for consume on topic '%s' p%d for consumer '%s': %v", topicName, partitionID, consumerID, err)
+		log.Printf("❌ Read messages consume topic '%s' p%d consumer '%s': %v", topicName, partitionID, consumerID, err)
 		c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to read messages", err.Error()))
 		return
 	}
-
-	// Priority Filtering
 	messagesToSend := make([]StoredMessage, 0, len(rawMessages))
 	for _, msg := range rawMessages {
 		if msg.Priority == "high" {
@@ -770,8 +846,6 @@ func handleConsume(c *gin.Context) {
 			messagesToSend = append(messagesToSend, msg)
 		}
 	}
-
-	// Determine and Update Consumer Offset in BadgerDB
 	var finalConsumerNextOffset uint64
 	if len(messagesToSend) > 0 {
 		finalConsumerNextOffset = messagesToSend[len(messagesToSend)-1].Offset + 1
@@ -784,9 +858,6 @@ func handleConsume(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"consumerID": consumerID, "topic": topicName, "partitionID": partitionID, "messages": messagesToSend, "startOffset": currentConsumerOffset, "count": len(messagesToSend), "nextOffset": finalConsumerNextOffset})
 }
-
-// --- Admin Handlers ---
-
 func handleGetTopics(c *gin.Context) {
 	broker.mu.RLock()
 	defer broker.mu.RUnlock()
@@ -817,95 +888,42 @@ func handleGetPartitions(c *gin.Context) {
 	partitionIDs := make([]int, 0, len(topic.Partitions))
 	for id := range topic.Partitions {
 		partitionIDs = append(partitionIDs, id)
-	}
+	} // Only list initialized partitions
 	sort.Ints(partitionIDs)
 	for _, id := range partitionIDs {
 		partitionInfos = append(partitionInfos, PartitionInfo{ID: id})
 	}
 	c.JSON(http.StatusOK, gin.H{"topic": topicName, "configuredPartitions": topic.NumPartitions, "partitionKeyStrategy": "consistent_hash+round_robin_fallback", "activePartitions": partitionInfos})
 }
-
-// -- Replication across 3 Nodes
-
-type Peer struct {
-	ID      string `yaml:"id"`
-	Address string `yaml:"address"`
-}
-
-type Config struct {
-	NodeID   string `yaml:"node_id"`
-	HTTPPort int    `yaml:"http_port"`
-	Peers    []Peer `yaml:"peers"`
-}
-
-type ClusterManager struct {
-	NodeID string
-	Peers  map[string]string // map[peerID]address
-	Client *http.Client
-}
-
-func NewClusterManager(cfg *Config) *ClusterManager {
-	peers := make(map[string]string)
-	for _, p := range cfg.Peers {
-		peers[p.ID] = p.Address
-	}
-	return &ClusterManager{
-		NodeID: cfg.NodeID,
-		Peers:  peers,
-		Client: &http.Client{Timeout: 2 * time.Second},
-	}
-}
-
-func LoadConfig(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var cfg Config
-	err = yaml.Unmarshal(data, &cfg)
-	if err != nil {
-		return nil, err
-	}
-	return &cfg, nil
-}
-
-type ReplicationRequest struct {
-	Topic        string `json:"topic"`
-	PartitionID  int    `json:"partitionID"`
-	Value        string `json:"value"`
-	Priority     string `json:"priority"`
-	OriginNodeID string `json:"originNodeID"`
-}
-
-func handleReplication(c *gin.Context) {
-	var req ReplicationRequest
-	if err := c.BindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Invalid replication request", err.Error()))
+func handleRaftStats(c *gin.Context) {
+	topicName := c.Query("topic")
+	partitionIDStr := c.Query("partitionID")
+	if topicName == "" || partitionIDStr == "" {
+		c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "topic and partitionID query parameters are required", ""))
 		return
 	}
-
-	// Skip if replicated from self
-	if req.OriginNodeID == cluster.NodeID {
-		c.JSON(http.StatusOK, gin.H{"status": "ignored (from self)"})
-		return
-	}
-
-	topic, err := broker.getOrCreateTopic(req.Topic)
+	partitionID, err := strconv.Atoi(partitionIDStr)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to access topic", err.Error()))
+		c.JSON(http.StatusBadRequest, NewApiError("ValidationError", "Invalid partitionID format", err.Error()))
 		return
 	}
-	partition, err := topic.getOrCreatePartition(req.PartitionID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, NewApiError("ServerError", "Failed to access partition", err.Error()))
+	broker.mu.RLock()
+	topic, topicExists := broker.Topics[topicName]
+	broker.mu.RUnlock()
+	if !topicExists {
+		c.JSON(http.StatusNotFound, NewApiError("NotFoundError", "Topic not found", topicName))
 		return
 	}
-	_, err = partition.AppendMessage(req.Value, req.Priority)
-	if err != nil {
-		log.Printf("❌ Replication append failed: %v", err)
-		c.JSON(http.StatusInternalServerError, NewApiError("ReplicationError", "Failed to append replicated message", err.Error()))
+	topic.mu.RLock()
+	partition, partExists := topic.Partitions[partitionID]
+	topic.mu.RUnlock()
+	if !partExists {
+		c.JSON(http.StatusNotFound, NewApiError("NotFoundError", "Partition not found or not yet initialized", fmt.Sprintf("%s/p%d", topicName, partitionID)))
 		return
 	}
-
-	c.JSON(http.StatusOK, gin.H{"status": "replicated"})
+	if partition.raftNode == nil {
+		c.JSON(http.StatusServiceUnavailable, NewApiError("ServiceUnavailable", "Raft not initialized for this partition", ""))
+		return
+	}
+	c.JSON(http.StatusOK, partition.raftNode.Stats())
 }
