@@ -1,0 +1,12 @@
+default_num_partitions: 3
+
+nodes:
+  node1:
+    http_address: "localhost:8081"
+    raft_address: "localhost:9001"
+  node2:
+    http_address: "localhost:8082"
+    raft_address: "localhost:9002"
+  node3:
+    http_address: "localhost:8083"
+    raft_address: "localhost:9003"
