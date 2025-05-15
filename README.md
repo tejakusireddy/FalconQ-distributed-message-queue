@@ -65,9 +65,9 @@ FalconQ is a high-performance distributed message queue inspired by Apache Kafka
 | `GET`  | `/topics/:topic/partitions`                 | View partition IDs for a specific topic         |
 ---
 
-## 🧪 Example Usage (CURL)
+### 🧪 Example Usage (CURL)
 
-### Publish messages to the 'orders' topic
+#### Publish messages to the 'orders' topic
 curl -X POST http://localhost:8080/topic/orders/publish \
   -H "Content-Type: application/json" \
   -d '{"message": "🔥 Urgent refund request #RF001", "priority": "high"}'
@@ -137,7 +137,6 @@ graph TD
 
 
 
-  style BadgerDB fill:#f9f,stroke:#333,stroke-width:2px
 
   Publish --> Broker  
   Peek --> Broker  
