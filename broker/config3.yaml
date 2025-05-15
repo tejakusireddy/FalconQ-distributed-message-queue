@@ -1,0 +1,7 @@
+node_id: broker3
+http_port: 8082
+peers:
+  - id: broker1
+    address: http://localhost:8080
+  - id: broker2
+    address: http://localhost:8081
