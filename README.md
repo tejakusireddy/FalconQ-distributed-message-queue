@@ -81,12 +81,14 @@ curl -X POST http://localhost:8080/topic/orders/publish \
   -d '{"message": "🔥 Critical stock update #SKU001", "priority": "high"}'
 
 Consume messages for consumer 'worker1' (gets high priority first)
+
 First call:
 curl "http://localhost:8080/topic/orders/consume?consumerID=worker1&batch=2"
 Example Response: 
 [{"v":"🔥 Urgent refund request #RF001","p":"high","Offset":0},{"v":"🔥 Critical stock update #SKU001","p":"high","Offset":2}], nextOffset: 3
 
 Second call (will get low priority if available):
+
 curl "http://localhost:8080/topic/orders/consume?consumerID=worker1&batch=2"
 Example Response: 
 [{"v":"🧊 Normal order placement #ORD001","p":"low","Offset":1}], nextOffset: 2 (Note: actual offset depends on internal filtering)
